@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import weakref
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
@@ -11,7 +12,10 @@ from sglang.jit_kernel.fused_store_index_cache import (
     can_use_nsa_fused_store,
     fused_store_index_k_cache,
 )
+from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.compilation.piecewise_context_manager import get_forward_context
 from sglang.srt.environ import envs
+from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
@@ -159,6 +163,80 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     return hadamard_transform(x, scale=hidden_size**-0.5)
 
 
+# Registry of Indexer modules keyed by layer_id. Used by the opaque custom op
+# below so we can look up the stateful module from inside an op body (which
+# only accepts tensors + scalars in its schema).
+_indexer_registry: Dict[int, "weakref.ReferenceType[Indexer]"] = {}
+
+
+def _register_indexer(indexer: "Indexer", layer_id: int) -> None:
+    _indexer_registry[layer_id] = weakref.ref(indexer)
+
+
+def _lookup_indexer(layer_id: int) -> "Indexer":
+    ref = _indexer_registry.get(layer_id)
+    assert ref is not None, f"Indexer for layer_id={layer_id} not registered"
+    ind = ref()
+    assert ind is not None, f"Indexer for layer_id={layer_id} was garbage-collected"
+    return ind
+
+
+def _fake_nsa_indexer_topk(
+    x: torch.Tensor,
+    q_lora: torch.Tensor,
+    positions: torch.Tensor,
+    layer_id: int,
+) -> torch.Tensor:
+    indexer = _lookup_indexer(layer_id)
+    return torch.empty(
+        (x.shape[0], indexer.index_topk),
+        dtype=torch.int32,
+        device=x.device,
+    )
+
+
+@register_custom_op(fake_impl=_fake_nsa_indexer_topk)
+@register_split_op()
+def nsa_indexer_topk(
+    x: torch.Tensor,
+    q_lora: torch.Tensor,
+    positions: torch.Tensor,
+    layer_id: int,
+) -> torch.Tensor:
+    """Opaque wrapper around Indexer.forward_cuda for piecewise CUDA graph.
+
+    This op shields Dynamo from all data-dependent control flow inside the NSA
+    indexer (e.g. `seq_lens_cpu.max().item()` in forward_cuda, chunking guards
+    in `_get_topk_ragged`, and the per-batch .item() loop in the fallback
+    `forward_indexer`). Inside an `install_torch_compiled` fullgraph region,
+    the op is emitted as a single call_function node; at runtime it dispatches
+    to the Python-level `Indexer.forward_cuda` which runs eagerly.
+
+    Requires `set_forward_context(...)` to have been entered (piecewise
+    capture/replay does this). Callers outside that context must invoke
+    `Indexer.forward_cuda` directly.
+    """
+    ctx = get_forward_context()
+    assert ctx is not None, (
+        "nsa_indexer_topk called outside set_forward_context — the piecewise "
+        "dispatch path should only fire when inside PCG capture/replay."
+    )
+    indexer = _lookup_indexer(layer_id)
+    result = indexer.forward_cuda(
+        x, q_lora, positions, ctx.forward_batch, layer_id
+    )
+    if result is None:
+        # Backend signaled "skip NSA for this batch" (rare). Fake impl returns
+        # a [T, index_topk] int32; mirror that here so the caller's downstream
+        # kernel sees the expected shape. Values are ignored in that case.
+        return torch.empty(
+            (x.shape[0], indexer.index_topk),
+            dtype=torch.int32,
+            device=x.device,
+        )
+    return result
+
+
 class Indexer(MultiPlatformOp):
     def __init__(
         self,
@@ -240,6 +318,16 @@ class Indexer(MultiPlatformOp):
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
+        _register_indexer(self, layer_id)
+
+    def forward(self, x, q_lora, positions, forward_batch, layer_id):
+        # Route through the opaque custom op when a piecewise forward context is
+        # active so Dynamo treats the entire indexer as a leaf (bypasses DDCF on
+        # seq_lens_cpu.max().item(), chunking guards, etc.). Only works when x
+        # is a plain Tensor; tuple-activation paths fall back to eager.
+        if get_forward_context() is not None and isinstance(x, torch.Tensor):
+            return nsa_indexer_topk(x, q_lora, positions, layer_id)
+        return super().forward(x, q_lora, positions, forward_batch, layer_id)
 
     @contextlib.contextmanager
     def _with_real_sm_count(self):
