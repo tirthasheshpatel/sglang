@@ -124,6 +124,53 @@ if _is_cuda:
             topk_result,
         )
 
+    @register_custom_op(mutates_args=["topk_result"])
+    @register_split_op()
+    def k_only_pcg(
+        layer_id: int,
+        key: torch.Tensor,
+        topk_result: torch.Tensor,
+    ) -> None:
+        """Opaque-op shield for `_forward_cuda_k_only` under piecewise CUDA graph.
+
+        The bf16 K projection runs in the captured graph (caller passes `key`
+        in); the eager body — fused store + dummy-logits topk_transform —
+        runs at replay time, where Python-side metadata access still works.
+        """
+        from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
+
+        forward_batch = get_forward_context().forward_batch
+        indexer = get_forward_context().nsa_indexers[layer_id]
+        metadata = forward_batch.attn_backend.get_indexer_metadata(
+            layer_id, forward_batch
+        )
+
+        # Slice off PCG padding (mirrors k_cache_and_topk_result).
+        extend_num_tokens = forward_batch.extend_num_tokens
+
+        indexer._store_index_k_cache(
+            forward_batch=forward_batch,
+            layer_id=layer_id,
+            key=key[:extend_num_tokens],
+            act_quant=act_quant,
+            out_cache_loc=forward_batch.out_cache_loc[:extend_num_tokens],
+        )
+        # MLA fast path: dummy zero logits + topk_transform produces
+        # [0, 1, ..., min(L_i, topk)-1, -1, ...] per row via the kernel's
+        # zero-logit tiebreaker. The transform output is sized by the live
+        # extend_num_tokens (no padding); write into the bucket-sized
+        # topk_result via slice assignment, matching _get_topk_ragged's pattern.
+        seq_lens_expanded = metadata.get_seqlens_expanded()
+        dummy_logits = torch.zeros(
+            seq_lens_expanded.shape[0],
+            indexer.index_topk,
+            dtype=torch.float32,
+            device=key.device,
+        )
+        topk_result[: seq_lens_expanded.shape[0]] = metadata.topk_transform(
+            dummy_logits, indexer.index_topk
+        )
+
     def _logits_head_gate_pcg_fake_impl(
         x: torch.Tensor,
         weight: torch.Tensor,
@@ -1211,19 +1258,34 @@ class Indexer(MultiPlatformOp):
             and q_lora.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
         )
 
-        # Determine if should skip topk based on sequence length
-        # We can only skip the logits computation if cuda graph is not involved
+        # Determine if should skip topk based on sequence length.
         skip_logits_computation = False
-        if (
-            not is_in_piecewise_cuda_graph()
-            and forward_batch.forward_mode.is_extend_without_speculative()
-        ):
-            if forward_batch.seq_lens_cpu is not None:
+        if forward_batch.forward_mode.is_extend_without_speculative():
+            if is_in_piecewise_cuda_graph():
+                # Bucket dim is a Python int at trace time; Dynamo specializes
+                # per-bucket so the branch is a compile-time constant per
+                # captured graph.
+                skip_logits_computation = x_meta.shape[0] <= self.index_topk
+            elif forward_batch.seq_lens_cpu is not None:
                 max_kv_len = forward_batch.seq_lens_cpu.max().item()
                 skip_logits_computation = max_kv_len <= self.index_topk
 
         # Optimization: fast path when skipping topk computation
         if skip_logits_computation and (not self.nsa_enable_prefill_cp):
+            if is_in_piecewise_cuda_graph():
+                # K projection is graphable; run it inline so it's part of the
+                # captured graph. The remainder of the fast path (fused store
+                # + topk_transform) is shielded behind a split-op since its
+                # metadata access is not torch.compile-traceable.
+                key = self._get_k_bf16(x, positions, enable_dual_stream)
+                topk_result = torch.full(
+                    (x_meta.shape[0], self.index_topk),
+                    -1,
+                    dtype=torch.int32,
+                    device=x_meta.device,
+                )
+                k_only_pcg(layer_id, key, topk_result)
+                return maybe_capture_indexer_topk(layer_id, topk_result)
             return maybe_capture_indexer_topk(
                 layer_id,
                 self._forward_cuda_k_only(
